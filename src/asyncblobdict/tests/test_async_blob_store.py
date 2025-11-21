@@ -448,10 +448,11 @@ async def test_local_delete_outside_protection(backend, tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.local
 async def test_symlink_outside_protection(backend, tmp_path):
+    import os
+
     if not hasattr(os, "symlink"):
         pytest.skip("Symlinks not supported on this platform")
     if sys.platform == "win32":
-        # Windows requires admin or Developer Mode for symlinks
         try:
             test_link = tmp_path / "test_link"
             test_target = tmp_path / "test_target"
@@ -459,27 +460,16 @@ async def test_symlink_outside_protection(backend, tmp_path):
             test_link.symlink_to(test_target)
         except OSError:
             pytest.skip("Symlink creation not permitted on this Windows system")
+
     adapter, container = backend
-    if not isinstance(adapter, LocalFileAdapter):
-        pytest.skip("Symlink protection test only applies to LocalFileAdapter")
-
     container_handle = adapter.get_container(container)
-    assert isinstance(container_handle, _LocalContainerHandle)
-
-    # Create a file outside the container
     outside_file = tmp_path.parent / "outside.txt"
     outside_file.write_text("secret")
 
-    # Create a symlink inside the container pointing to the outside file
+    assert isinstance(container_handle, _LocalContainerHandle)
     symlink_path = container_handle._container_path / "link.txt"
     symlink_path.symlink_to(outside_file)
 
-    blob_handle = container_handle.get_blob("link.txt")
-
-    # Download should fail due to symlink escape
+    # Accept ValueError at get_blob() as valid protection
     with pytest.raises(ValueError):
-        await blob_handle.download()
-
-    # Delete should also fail
-    with pytest.raises(ValueError):
-        await blob_handle.delete()
+        container_handle.get_blob("link.txt")

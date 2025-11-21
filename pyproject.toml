@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "asyncblobdict"
-version = "0.1.13"
+version = "0.1.131"
 description = "Minimal async key-value store backed by local or cloud blob storage"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,3 +38,5 @@ dev = [
     "python-dotenv"
 ]
 
+[project.urls]
+Repository = "https://github.com/ViLahte/asyncblobdict"
