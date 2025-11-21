@@ -1,7 +1,7 @@
 from typing import Any
 
 from .async_blob_store import ConcurrencyError
-from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError
+from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError, ResourceExistsError, HttpResponseError
 from azure.storage.blob.aio import BlobServiceClient
 
 from .storage_protocols import (
@@ -73,6 +73,14 @@ class _AzureBlobHandle(AsyncBlobHandle):
             raise ConcurrencyError(
                 f"ETag mismatch for blob '{self._blob_client.blob_name}'"
             )
+        except ResourceExistsError:
+            raise FileExistsError(
+                f"Blob '{self._blob_client.blob_name}' already exists"
+            )
+        except HttpResponseError as e:
+            if getattr(e, "status_code", None) == 412:
+                raise ConcurrencyError(f"ETag mismatch for blob '{self._blob_client.blob_name}'")
+            raise
 
     async def delete(self) -> None:
         try:
