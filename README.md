@@ -1,6 +1,7 @@
 # asyncblobdict
 
-![Tests] (https://github.com/ViLahte/asyncblobdict/actions/workflows/tests.yml/badge.svg) [![codecov] (https://codecov.io/gh/ViLahte/asyncblobdict/branch/main/graph/badge.svg)](https://codecov.io/gh/ViLahte/asyncblobdict)
+![Tests](https://github.com/ViLahte/asyncblobdict/actions/workflows/tests.yml/badge.svg)
+[![codecov](https://codecov.io/gh/ViLahte/asyncblobdict/branch/main/graph/badge.svg)](https://codecov.io/gh/ViLahte/asyncblobdict)
 
 **asyncblobdict** is a minimal async‑friendly key–value store for JSON and binary data, backed by either:
 
