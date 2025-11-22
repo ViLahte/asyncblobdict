@@ -1,9 +1,9 @@
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from .errors import BlobNotFoundError, ConcurrencyError
-from .serializers import BinarySerializer, ExtendedJSON, JSONSerializer
+from .serializers import BinarySerializer, JSONSerializer, Serializer
 from .storage_protocols import AsyncBlobHandle, AsyncStorageAdapter
 
 
@@ -24,7 +24,7 @@ class CacheEntry:
     etag: str | None
 
 
-class AsyncCoreBlobStore:
+class AsyncBlobStoreCore:
     """
     Core store: raw bytes only.
     Handles caching and concurrency control.
@@ -42,10 +42,9 @@ class AsyncCoreBlobStore:
         self.container = adapter.get_container(container_name)
         self.cache_mode = cache_mode
         self.concurrency_mode = concurrency_mode
-        # Cache is now keyed by actual blob_name
         self._cache: dict[str, CacheEntry] = {}
 
-    async def __aenter__(self) -> "AsyncCoreBlobStore":
+    async def __aenter__(self) -> "AsyncBlobStoreCore":
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -62,10 +61,6 @@ class AsyncCoreBlobStore:
             return None
 
     async def get_bytes(self, blob_name: str) -> bytes:
-        """
-        Retrieve raw bytes for a blob.
-        Uses cache if enabled and blob_name is present.
-        """
         if self.cache_mode != CacheMode.NONE and blob_name in self._cache:
             return self._cache[blob_name].value
 
@@ -87,21 +82,12 @@ class AsyncCoreBlobStore:
         blob_name: str,
         data: bytes,
         etag: str | None = None,
-        force_no_etag_check: bool = False,
     ) -> None:
-        """
-        Store raw bytes for a blob.
-        In WRITE_BACK mode, only updates cache.
-        In WRITE_THROUGH or NONE mode, writes immediately to backend.
-        """
         if self.cache_mode != CacheMode.NONE:
             self._cache[blob_name] = CacheEntry(value=data, etag=etag)
 
         if self.cache_mode in (CacheMode.WRITE_THROUGH, CacheMode.NONE):
-            if (
-                self.concurrency_mode == ConcurrencyMode.ETAG
-                and not force_no_etag_check
-            ):
+            if self.concurrency_mode == ConcurrencyMode.ETAG:
                 if etag is None:
                     blob = self.container.get_blob(blob_name)
                     etag = await self.get_etag_or_none(blob)
@@ -110,9 +96,6 @@ class AsyncCoreBlobStore:
             await blob.upload(data, overwrite=True, if_match=etag)
 
     async def delete(self, blob_name: str) -> None:
-        """
-        Delete blob from backend and remove from cache if present.
-        """
         blob = self.container.get_blob(blob_name)
         try:
             await blob.delete()
@@ -123,19 +106,12 @@ class AsyncCoreBlobStore:
             del self._cache[blob_name]
 
     async def list_keys(self, prefix: str = "") -> list[str]:
-        """
-        List blob names in container.
-        """
         return await self.container.list_blob_names(prefix)
 
     async def sync(
         self, etag_behavior: Literal["skip", "overwrite", "raise"] = "skip"
     ) -> None:
-        """
-        Flush cached blobs to backend.
-        """
         if self.cache_mode == CacheMode.NONE:
-            # TODO Should probably clean cache if mode is changed mid way.
             raise RuntimeError("Cache is disabled, nothing to sync.")
 
         for blob_name, entry in list(self._cache.items()):
@@ -168,79 +144,31 @@ class AsyncCoreBlobStore:
             )
 
 
-class AsyncFormatBlobStore:
-    """
-    Format-aware store: wraps AsyncCoreBlobStore to add JSON/binary serialization.
-    Responsible for naming (.json) and format validation.
-    """
+class SerializerView:
+    """A namespaced view into AsyncBlobStore for a specific serializer format."""
 
-    def __init__(
-        self,
-        core_store: AsyncCoreBlobStore,
-        json_serializer: JSONSerializer | None = None,
-        binary_serializer: BinarySerializer | None = None,
-    ) -> None:
-        self.core = core_store
-        self.json_serializer = json_serializer or JSONSerializer()
-        self.binary_serializer = binary_serializer or BinarySerializer()
+    def __init__(self, store: "AsyncBlobStore", format: str):
+        self._store = store
+        self._format = format
 
-    def _blob_name_json(self, key: str) -> str:
-        assert isinstance(key, str)
-        return f"{key}.json"
+    async def get(self, key: str):
+        return await self._store._get(key, self._format)
 
-    def _blob_name_binary(self, key: str) -> str:
-        assert isinstance(key, str)
-        return key
+    async def set(self, key: str, value: Any):
+        return await self._store._set(key, value, self._format)
 
-    async def get_json(self, key: str) -> ExtendedJSON:
-        blob_name = self._blob_name_json(key)
-        raw = await self.core.get_bytes(blob_name)  # cache key now always blob_name
-        try:
-            return self.json_serializer.deserialize(raw)
-        except Exception as e:
-            raise ValueError(f"Blob '{key}' is not valid JSON") from e
-
-    async def set_json(
-        self, key: str, value: ExtendedJSON, force_no_etag_check: bool = False
-    ) -> None:
-        raw = self.json_serializer.serialize(value)
-        blob_name = self._blob_name_json(key)
-        await self.core.set_bytes(
-            blob_name,
-            raw,
-            force_no_etag_check=force_no_etag_check,
-        )
-
-    async def get_binary(self, key: str) -> bytes:
-        blob_name = self._blob_name_binary(key)
-        return await self.core.get_bytes(blob_name)
-
-    async def set_binary(
-        self, key: str, data: bytes, force_no_etag_check: bool = False
-    ) -> None:
-        raw = self.binary_serializer.serialize(data)
-        blob_name = self._blob_name_binary(key)
-        await self.core.set_bytes(
-            blob_name,
-            raw,
-            force_no_etag_check=force_no_etag_check,
-        )
-
-    async def delete_json(self, key: str) -> None:
-        blob_name = self._blob_name_json(key)
-        await self.core.delete(blob_name)
-
-    async def delete_binary(self, key: str) -> None:
-        blob_name = self._blob_name_binary(key)
-        await self.core.delete(blob_name)
-
-    async def list_keys(self, prefix: str = "") -> list[str]:
-        return await self.core.list_keys(prefix)
+    async def delete(self, key: str):
+        return await self._store._delete(key, self._format)
 
 
 class AsyncBlobStore:
+    json: SerializerView
+    binary: SerializerView
+    default_view: SerializerView
+
     """
-    Compatibility wrapper for old AsyncBlobStore API.
+    Format-aware store: wraps AsyncBlobStoreCore to add serializer-driven naming.
+    Provides serializer-specific views (e.g., .json, .binary) and a default view.
     """
 
     def __init__(
@@ -249,65 +177,79 @@ class AsyncBlobStore:
         container_name: str,
         cache_mode: CacheMode = CacheMode.NONE,
         concurrency_mode: ConcurrencyMode = ConcurrencyMode.NONE,
-        json_serializer: JSONSerializer | None = None,
-        binary_serializer: BinarySerializer | None = None,
+        serializers: dict[str, Serializer] | None = None,
+        default_format: str = "binary",  # default view format
     ) -> None:
-        self._core = AsyncCoreBlobStore(
+        self.core = AsyncBlobStoreCore(
             adapter,
             container_name,
             cache_mode=cache_mode,
             concurrency_mode=concurrency_mode,
         )
-        self._format = AsyncFormatBlobStore(
-            self._core,
-            json_serializer=json_serializer,
-            binary_serializer=binary_serializer,
-        )
-        # Compatibility: expose _cache for tests
-        self._cache = self._core._cache
-        self.concurrency_mode = self._core.concurrency_mode
+        self.serializers = serializers or {
+            "json": JSONSerializer(),
+            "binary": BinarySerializer(),
+        }
+
+        self._cache = self.core._cache  # for tests
+        self.concurrency_mode = self.core.concurrency_mode
+
+        # Create serializer views for all formats
+        for fmt in self.serializers:
+            view = SerializerView(self, fmt)
+            setattr(self, fmt, view)
+
+        # Set default view
+        if default_format not in self.serializers:
+            raise ValueError(f"Default format '{default_format}' not in serializers")
+        self.default_view = getattr(self, default_format)
 
     async def __aenter__(self) -> "AsyncBlobStore":
-        await self._core.__aenter__()
+        await self.core.__aenter__()
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
-        await self._core.__aexit__(exc_type, exc, tb)
+        await self.core.__aexit__(exc_type, exc, tb)
 
     async def close(self) -> None:
-        await self._core.close()
+        await self.core.close()
 
-    async def get_json(self, key: str) -> ExtendedJSON:
-        return await self._format.get_json(key)
+    def _blob_name(self, key: str, serializer: Serializer) -> str:
+        return serializer.name_strategy(key)
 
-    async def set_json(self, key: str, value: ExtendedJSON) -> None:
-        await self._format.set_json(key, value)
+    # --- Internal format-based methods ---
+    async def _get(self, key: str, format: str) -> Any:
+        serializer = self.serializers[format]
+        blob_name = self._blob_name(key, serializer)
+        raw = await self.core.get_bytes(blob_name)
+        return serializer.deserialize(raw)
 
-    async def get_binary(self, key: str) -> bytes:
-        return await self._format.get_binary(key)
+    async def _set(self, key: str, value: Any, format: str) -> None:
+        serializer = self.serializers[format]
+        raw = serializer.serialize(value)
+        blob_name = self._blob_name(key, serializer)
+        await self.core.set_bytes(blob_name, raw)
 
-    async def set_binary(self, key: str, data: bytes) -> None:
-        await self._format.set_binary(key, data)
+    async def _delete(self, key: str, format: str) -> None:
+        serializer = self.serializers[format]
+        blob_name = self._blob_name(key, serializer)
+        await self.core.delete(blob_name)
 
-    async def delete_json(self, key: str) -> None:
-        await self._format.delete_json(key)
+    # --- Public default view methods ---
+    async def get(self, key: str):
+        return await self.default_view.get(key)
 
-    async def delete_binary(self, key: str) -> None:
-        await self._format.delete_binary(key)
+    async def set(self, key: str, value: Any):
+        return await self.default_view.set(key, value)
 
+    async def delete(self, key: str):
+        return await self.default_view.delete(key)
+
+    # --- Pass-through core methods ---
     async def list_keys(self, prefix: str = "") -> list[str]:
-        return await self._format.list_keys(prefix)
+        return await self.core.list_keys(prefix)
 
     async def sync(
         self, etag_behavior: Literal["skip", "overwrite", "raise"] = "skip"
     ) -> None:
-        await self._core.sync(etag_behavior)
-
-    async def get(self, key: str) -> ExtendedJSON:
-        return await self.get_json(key)
-
-    async def set(self, key: str, value: ExtendedJSON) -> None:
-        return await self.set_json(key, value)
-
-    async def delete(self, key: str) -> None:
-        await self.delete_json(key)
+        await self.core.sync(etag_behavior)

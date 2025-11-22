@@ -5,12 +5,14 @@ from uuid import UUID
 
 
 class Serializer(Protocol):
+    extension: str | None = None
+
     def serialize(self, obj: Any) -> bytes: ...
     def deserialize(self, data: bytes) -> Any: ...
+    def name_strategy(self, key: str) -> str: ...
 
 
 TYPE_MARKER = "_bdtype_"
-
 JSONScalar = str | int | float | bool | datetime | UUID | None
 JSONValue = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
 ExtendedJSON = (
@@ -39,7 +41,9 @@ def default_decoder(d: dict[str, Any]) -> Any:
     return d
 
 
-class JSONSerializer:
+class JSONSerializer(Serializer):
+    extension = "json"
+
     def serialize(self, obj: Any) -> bytes:
         try:
             return json.dumps(obj, default=default_encoder).encode("utf-8")
@@ -52,8 +56,13 @@ class JSONSerializer:
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON data: {e}")
 
+    def name_strategy(self, key: str) -> str:
+        return f"{key}.{self.extension}"
 
-class BinarySerializer:
+
+class BinarySerializer(Serializer):
+    extension = None
+
     def serialize(self, obj: bytes) -> bytes:
         if not isinstance(obj, (bytes, bytearray)):
             raise ValueError("Binary data must be bytes or bytearray")
@@ -61,3 +70,6 @@ class BinarySerializer:
 
     def deserialize(self, data: bytes) -> bytes:
         return data
+
+    def name_strategy(self, key: str) -> str:
+        return key

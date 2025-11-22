@@ -1,17 +1,13 @@
-![Tests](https://github.com/ViLahte/asyncblobdict/actions/workflows/tests.yml/badge.svg)
-[![codecov](https://codecov.io/gh/ViLahte/asyncblobdict/branch/main/graph/badge.svg)](https://codecov.io/gh/ViLahte/asyncblobdict)
-
-
 # asyncblobdict
 
+![Tests] (https://github.com/ViLahte/asyncblobdict/actions/workflows/tests.yml/badge.svg) [![codecov] (https://codecov.io/gh/ViLahte/asyncblobdict/branch/main/graph/badge.svg)](https://codecov.io/gh/ViLahte/asyncblobdict)
 
 **asyncblobdict** is a minimal async‑friendly key–value store for JSON and binary data, backed by either:
 
 - Local filesystem
 - Azure Blob Storage
 
-It lets you store and retrieve Python data by key, with optional caching and optimistic concurrency via ETags.
-Swap backends without changing your application code.
+It lets you store and retrieve Python data by key, with optional caching and optimistic concurrency via ETags, and swap backends without changing your application code.
 
 ---
 
@@ -22,12 +18,16 @@ Swap backends without changing your application code.
   - JSON‑serializable (`dict`, `list`, `set`, `datetime`, etc.)
   - Arbitrary binary (`bytes`, `bytearray`)
 - **Caching modes**:
-  - `NONE` - always read/write directly to backend
-  - `WRITE_THROUGH` - cache and immediately write to backend
-  - `WRITE_BACK` - cache and sync later
+  - `NONE` — always read/write directly to backend
+  - `WRITE_THROUGH` — cache and immediately write to backend
+  - `WRITE_BACK` — cache and sync later
 - **Concurrency modes**:
-  - `NONE` - no concurrency control
-  - `ETAG` - optimistic concurrency using ETags
+  - `NONE` — no concurrency control
+  - `ETAG` — optimistic concurrency using ETags
+- **Serializer views**:
+  - `store.json` — JSON serializer view
+  - `store.binary` — binary serializer view
+  - `store.default_view` — default serializer view (format chosen at init)
 
 ---
 
@@ -57,7 +57,7 @@ pip install -e .
 import asyncio
 import pickle
 from datetime import datetime
-from asyncblobdict import AsyncBlobStore, CacheMode, ConcurrencyMode, LocalFileAdapter, BlobNotFoundError
+from asyncblobdict import AsyncBlobStore, CacheMode, ConcurrencyMode, LocalFileAdapter
 
 async def main():
     adapter = LocalFileAdapter("./local_blob_storage")
@@ -66,32 +66,26 @@ async def main():
         "demo_container",
         cache_mode=CacheMode.WRITE_THROUGH,
         concurrency_mode=ConcurrencyMode.ETAG,
+        default_format="json",  # default view is JSON
     ) as store:
-        # Store JSON
-        config = {"learning_rate": 0.01, "layers": [64, 128, 256], "created_at": datetime.utcnow()}
-        await store.set_json("demo/config", config)
+        # Store JSON (default view)
+        await store.set("demo/config", {"learning_rate": 0.01, "created_at": datetime.utcnow()})
 
         # Retrieve JSON
-        loaded_config = await store.get_json("demo/config")
-        print("Loaded config:", loaded_config)
+        print(await store.get("demo/config"))
 
-        # Store binary
+        # Store binary explicitly
         model_bytes = pickle.dumps({"weights": [0.1, 0.2, 0.3], "bias": 0.5})
-        await store.set_binary("demo/model.bin", model_bytes)
+        await store.binary.set("demo/model.bin", model_bytes)
 
         # Retrieve binary
-        loaded_model = pickle.loads(await store.get_binary("demo/model.bin"))
-        print("Loaded model:", loaded_model)
+        print(await store.binary.get("demo/model.bin"))
 
         # List keys
-        print("Keys:", await store.list_keys())
+        print(await store.list_keys())
 
         # Delete a key
         await store.delete("demo/config")
-        try:
-            await store.get_json("demo/config")
-        except BlobNotFoundError:
-            print("Config deleted successfully.")
 
 if __name__ == "__main__":
     asyncio.run(main())
@@ -99,37 +93,83 @@ if __name__ == "__main__":
 
 ---
 
-### Azure backend example
+## API Reference (Simplified)
 
-Requires environment variables:
+All methods are **async**.
 
-```env
-AZURE_CONN_STR=your-azure-connection-string
-AZURE_CONTAINER=your-container-name
+### Default view (format chosen at init)
+```python
+await store.set(key: str, value: Any)
+await store.get(key: str) -> Any
+await store.delete(key: str)
 ```
 
+### Format-specific views
 ```python
-import os
-import asyncio
-from datetime import datetime
-from dotenv import load_dotenv
-from asyncblobdict import AsyncBlobStore, CacheMode, ConcurrencyMode, AzureBlobAdapter
+await store.json.set(key, value)     # JSON serializer
+await store.json.get(key)            # returns Python object
+await store.binary.set(key, bytes)   # Binary serializer
+await store.binary.get(key)          # returns bytes
+```
 
-load_dotenv()
+### Other methods
+```python
+await store.list_keys(prefix: str = "") -> list[str]
+await store.sync(etag_behavior="skip")  # flush WRITE_BACK cache
+```
 
-async def main():
-    adapter = AzureBlobAdapter.from_connection_string(os.environ["AZURE_CONN_STR"])
-    async with AsyncBlobStore(
-        adapter,
-        os.environ["AZURE_CONTAINER"],
-        cache_mode=CacheMode.WRITE_THROUGH,
-        concurrency_mode=ConcurrencyMode.ETAG,
-    ) as store:
-        await store.set_json("demo/config", {"created_at": datetime.utcnow()})
-        print(await store.get_json("demo/config"))
+---
 
-if __name__ == "__main__":
-    asyncio.run(main())
+## Adding Your Own Serializer
+
+You can add new formats (e.g., YAML) by passing a `serializers` dict to `AsyncBlobStore`.
+
+```python
+import yaml
+
+from asyncblobdict import (
+    AsyncBlobStore,
+    BinarySerializer,
+    JSONSerializer,
+    LocalFileAdapter,
+    Serializer,
+)
+
+
+class YAMLSerializer(Serializer):
+    def serialize(self, value):
+        return yaml.dump(value).encode("utf-8")
+
+    def deserialize(self, raw: bytes):
+        return yaml.safe_load(raw.decode("utf-8"))
+
+    def name_strategy(self, key: str) -> str:
+        return f"{key}.yaml"
+
+
+LOCAL_BASE_PATH = "./local_blob_storage"
+LOCAL_CONTAINER = "test_container"
+
+serializers = {
+    "json": JSONSerializer(),
+    "binary": BinarySerializer(),
+    "yaml": YAMLSerializer(),
+}
+
+
+adapter = LocalFileAdapter(LOCAL_BASE_PATH)
+container_name = LOCAL_CONTAINER
+
+store = AsyncBlobStore(
+    adapter,
+    container_name,
+    serializers=serializers,
+    default_format="json",
+)
+
+# Now you can use:
+await store.yaml.set("config", {"a": 1})
+print(await store.yaml.get("config"))
 ```
 
 ---
@@ -153,19 +193,20 @@ pytest
 ```
 
 Azure tests are skipped automatically if environment variables are not set.
-You can also run only local tests:
+
+Run only local tests:
 
 ```bash
 pytest -m "not azure"
 ```
 
-Or only Azure tests:
+Run only Azure tests:
 
 ```bash
 pytest -m azure
 ```
 
-For code coverage html report:
+For code coverage HTML report:
 
 ```bash
 pytest --cov=src --cov-report=html
