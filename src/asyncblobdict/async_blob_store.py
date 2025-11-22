@@ -3,6 +3,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import Any, Literal, cast
+from collections import defaultdict
 
 from .storage_protocols import AsyncStorageAdapter
 
@@ -104,7 +105,7 @@ class AsyncBlobStore:
         self.cache_mode = cache_mode
         self.concurrency_mode = concurrency_mode
         # self._cache: dict[str, tuple[Any, str | None]] = {}
-        self._cache: dict[str, CacheEntry] = {}
+        self._cache: dict[str, CacheEntry] = defaultdict(lambda: CacheEntry(None, None))
 
     async def __aenter__(self) -> "AsyncBlobStore":
         return self
@@ -164,7 +165,7 @@ class AsyncBlobStore:
         except TypeError as e:
             raise ValueError(f"Value for key '{key}' is not JSON-serializable: {e}")
         etag = (
-            self._cache.get(key, CacheEntry(None, None)).etag
+            self._cache[key].etag
             if self.cache_mode != CacheMode.NONE
             else None
         )
@@ -217,7 +218,7 @@ class AsyncBlobStore:
         if not isinstance(data, (bytes, bytearray)):
             raise ValueError(f"Binary data for key '{key}' must be bytes or bytearray")
         etag = (
-            self._cache.get(key, CacheEntry(None, None)).etag
+            self._cache[key].etag
             if self.cache_mode != CacheMode.NONE
             else None
         )
