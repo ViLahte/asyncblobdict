@@ -13,12 +13,13 @@ from dotenv import load_dotenv
 from asyncblobdict import (
     AsyncBlobStore,
     AzureBlobAdapter,
-    BlobNotFoundError,
     CacheMode,
-    ConcurrencyError,
     ConcurrencyMode,
     LocalFileAdapter,
 )
+
+from asyncblobdict.errors import BlobNotFoundError, ConcurrencyError
+
 from asyncblobdict.local_file_adapter import _LocalBlobHandle, _LocalContainerHandle
 
 load_dotenv()
@@ -56,8 +57,8 @@ def local_backend():
 # ---------------------------
 @pytest.fixture(
     params=[
-        pytest.param("azure", marks=pytest.mark.azure),
         pytest.param("local", marks=pytest.mark.local),
+        pytest.param("azure", marks=pytest.mark.azure),
     ]
 )
 def backend(request, tmp_path):
@@ -173,13 +174,14 @@ async def test_non_json_serializable(backend):
         concurrency_mode=ConcurrencyMode.ETAG,
     ) as store_a:
         with pytest.raises(ValueError):
-            await store_a.set(key, lambda x: x)
+            await store_a.set(key, lambda x: x)  # type: ignore
 
 
 @pytest.mark.asyncio
 async def test_etag_conflict(backend):
     adapter, container = backend
     key = unique_key("user_settings_conflict")
+
     async with (
         AsyncBlobStore(
             adapter,
@@ -200,19 +202,24 @@ async def test_etag_conflict(backend):
         # Step 2: Force read to get real ETag
         store_a._cache.clear()
         await store_a.get(key)
-        old_etag = store_a._cache[key].etag
+
+        # use blob name for cache lookup
+        blob_name = store_a._format._blob_name_json(key)
+        old_etag = store_a._cache[blob_name].etag
         assert old_etag is not None, "ETag should not be None for conflict test"
 
-        # Step 3: Overwrite with store_b (disable ETag check)
+        # Step 3: Overwrite with store_b (disable ETag check, no cache)
         store_b.concurrency_mode = ConcurrencyMode.NONE
         await store_b.set(key, {"theme": "light"})
 
         # Step 4: Try to write with stale ETag
         with pytest.raises(ConcurrencyError):
-            await store_a.set_json(
-                key,
-                {"theme": "dark again", "random": random.randint(0, 1000)},
-                _test_use_stale_etag=True,
+            await store_a._core.set_bytes(
+                blob_name,
+                store_a._format.json_serializer.serialize(
+                    {"theme": "dark again", "random": random.randint(0, 1000)}
+                ),
+                etag=old_etag,
             )
 
 
@@ -263,7 +270,7 @@ async def test_list_keys(backend):
         await store_a.set_binary(key2, b"hello")
         keys = await store_b.list_keys("test_")
         assert any(key1 + ".json" == k for k in keys)
-        assert any(key2 + ".bin" == k for k in keys)
+        assert any(key2 == k for k in keys)
 
 
 @pytest.mark.asyncio
@@ -333,7 +340,7 @@ async def test_concurrency_error_on_etag_mismatch(backend):
     ch = adapter.get_container(container)
     blob = ch.get_blob("concurrent.txt")
     await blob.upload(b"first")
-    etag = await blob.get_etag()
+    await blob.get_etag()
     with pytest.raises(ConcurrencyError):
         await blob.upload(b"second", if_match="wrong-etag")
 

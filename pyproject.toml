@@ -14,7 +14,6 @@ authors = [
 ]
 dependencies = [
     "azure-storage-blob",
-    "orjson",
 ]
 classifiers = [
     "Development Status :: 4 - Beta",

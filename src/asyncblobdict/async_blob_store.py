@@ -1,29 +1,11 @@
-import json
 from dataclasses import dataclass
-from datetime import datetime
+from typing import Literal
 from enum import Enum
-from typing import Any, Literal, cast
-from collections import defaultdict
-
-from .storage_protocols import AsyncStorageAdapter
-
-# ---------------------------
-# JSON type definitions
-# ---------------------------
-JSONScalar = str | int | float | bool | None
-JSONValue = JSONScalar | list["JSONValue"] | dict[str, "JSONValue"]
-ExtendedJSON = (
-    JSONScalar
-    | list["ExtendedJSON"]
-    | dict[str, "ExtendedJSON"]
-    | set["ExtendedJSON"]
-    | datetime
-)
+from .errors import BlobNotFoundError, ConcurrencyError
+from .storage_protocols import AsyncStorageAdapter, AsyncBlobHandle
+from .serializers import JSONSerializer, BinarySerializer, ExtendedJSON
 
 
-# ---------------------------
-# Enums for configuration
-# ---------------------------
 class CacheMode(Enum):
     NONE = "none"  # No caching at all
     WRITE_THROUGH = "write_through"  # Cache + write immediately to backend
@@ -35,62 +17,17 @@ class ConcurrencyMode(Enum):
     ETAG = "etag"  # Use ETag optimistic concurrency
 
 
-# ---------------------------
-# Exceptions
-# ---------------------------
-class ConcurrencyError(Exception):
-    """Raised when ETag optimistic concurrency check fails."""
-
-    pass
-
-
-class BlobNotFoundError(Exception):
-    """Raised when a requested blob does not exist."""
-
-    pass
-
-
-# ---------------------------
-# JSON serialization helpers
-# ---------------------------
-def default_encoder(o: Any) -> Any:
-    if isinstance(o, set):
-        return {"__type__": "set", "items": list(o)}
-    if isinstance(o, datetime):
-        return {"__type__": "datetime", "value": o.isoformat()}
-    raise TypeError(f"Type {type(o)} not serializable to JSON")
-
-
-def default_decoder(d: dict[str, Any]) -> Any:
-    if "__type__" in d:
-        if d["__type__"] == "set":
-            return set(d["items"])
-        if d["__type__"] == "datetime":
-            return datetime.fromisoformat(d["value"])
-    return d
-
-
-# ---------------------------
-# AsyncBlobStore
-# ---------------------------
-
-
 @dataclass
 class CacheEntry:
-    value: Any
+    value: bytes
     etag: str | None
 
 
-class AsyncBlobStore:
+class AsyncCoreBlobStore:
     """
-    Backend-agnostic async blob store.
-
-    Handles:
-    - JSON/binary serialization
-    - Optional caching
-    - Optional ETag concurrency control
-
-    Relies on an AsyncStorageAdapter for actual storage operations.
+    Core store: raw bytes only.
+    Handles caching and concurrency control.
+    Format-agnostic — does not know about JSON/Binary extensions.
     """
 
     def __init__(
@@ -104,10 +41,10 @@ class AsyncBlobStore:
         self.container = adapter.get_container(container_name)
         self.cache_mode = cache_mode
         self.concurrency_mode = concurrency_mode
-        # self._cache: dict[str, tuple[Any, str | None]] = {}
-        self._cache: dict[str, CacheEntry] = defaultdict(lambda: CacheEntry(None, None))
+        # Cache is now keyed by actual blob_name
+        self._cache: dict[str, CacheEntry] = {}
 
-    async def __aenter__(self) -> "AsyncBlobStore":
+    async def __aenter__(self) -> "AsyncCoreBlobStore":
         return self
 
     async def __aexit__(self, exc_type, exc, tb) -> None:
@@ -116,220 +53,260 @@ class AsyncBlobStore:
     async def close(self) -> None:
         await self.adapter.close()
 
-    def _blob_name(self, key: str, ext: str) -> str:
-        return key if key.endswith(ext) else f"{key}{ext}"
+    @staticmethod
+    async def get_etag_or_none(blob: AsyncBlobHandle) -> str | None:
+        try:
+            return await blob.get_etag()
+        except BlobNotFoundError:
+            return None
 
-    async def get_json(self, key: str) -> ExtendedJSON:
+    async def get_bytes(self, blob_name: str) -> bytes:
         """
-        Retrieve a JSON blob from storage.
-
-        Args:
-            key: The blob key without extension.
-
-        Returns:
-            The deserialized JSON object.
-
-        Raises:
-            BlobNotFoundError: If the blob does not exist.
-            ValueError: If the blob contains invalid JSON.
+        Retrieve raw bytes for a blob.
+        Uses cache if enabled and blob_name is present.
         """
-        if self.cache_mode != CacheMode.NONE and key in self._cache:
-            # return self._cache[key][0]
-            return self._cache[key].value
-        blob_name = self._blob_name(key, ".json")
+        if self.cache_mode != CacheMode.NONE and blob_name in self._cache:
+            return self._cache[blob_name].value
+
+        blob = self.container.get_blob(blob_name)
+        data = await blob.download()
+        etag = (
+            await blob.get_etag()
+            if self.concurrency_mode == ConcurrencyMode.ETAG
+            else None
+        )
+
+        if self.cache_mode != CacheMode.NONE:
+            self._cache[blob_name] = CacheEntry(value=data, etag=etag)
+
+        return data
+
+    async def set_bytes(
+        self,
+        blob_name: str,
+        data: bytes,
+        etag: str | None = None,
+        force_no_etag_check: bool = False,
+    ) -> None:
+        """
+        Store raw bytes for a blob.
+        In WRITE_BACK mode, only updates cache.
+        In WRITE_THROUGH or NONE mode, writes immediately to backend.
+        """
+        if self.cache_mode != CacheMode.NONE:
+            self._cache[blob_name] = CacheEntry(value=data, etag=etag)
+
+        if self.cache_mode in (CacheMode.WRITE_THROUGH, CacheMode.NONE):
+            if (
+                self.concurrency_mode == ConcurrencyMode.ETAG
+                and not force_no_etag_check
+            ):
+                if etag is None:
+                    blob = self.container.get_blob(blob_name)
+                    etag = await self.get_etag_or_none(blob)
+
+            blob = self.container.get_blob(blob_name)
+            await blob.upload(data, overwrite=True, if_match=etag)
+
+    async def delete(self, blob_name: str) -> None:
+        """
+        Delete blob from backend and remove from cache if present.
+        """
         blob = self.container.get_blob(blob_name)
         try:
-            raw = await blob.download()
-        except FileNotFoundError:
-            raise BlobNotFoundError(f"Blob '{key}' not found")
-        try:
-            data = json.loads(raw, object_hook=default_decoder)
-            data = cast(ExtendedJSON, data)
-        except json.JSONDecodeError:
-            raise ValueError(f"Blob '{key}' does not contain valid JSON data")
-        etag = (
-            await blob.get_etag()
-            if self.concurrency_mode == ConcurrencyMode.ETAG
-            else None
-        )
-        if self.cache_mode != CacheMode.NONE:
-            # self._cache[key] = (data, etag)
-            self._cache[key] = CacheEntry(value=data, etag=etag)
-        return data
+            await blob.delete()
+        except BlobNotFoundError:
+            pass
 
-    async def set_json(
-        self, key: str, value: ExtendedJSON, _test_use_stale_etag: bool = False
-    ) -> None:
-        try:
-            json.dumps(value, default=default_encoder)
-        except TypeError as e:
-            raise ValueError(f"Value for key '{key}' is not JSON-serializable: {e}")
-        etag = (
-            self._cache[key].etag
-            if self.cache_mode != CacheMode.NONE
-            else None
-        )
-        if (
-            self.concurrency_mode == ConcurrencyMode.ETAG
-            and etag is None
-            and not _test_use_stale_etag
-        ):
-            blob = self.container.get_blob(self._blob_name(key, ".json"))
-            try:
-                etag = await blob.get_etag()
-                print(f"Fetched ETag for blob '{key}': {etag}")
-            except FileNotFoundError:
-                pass
-        if self.cache_mode != CacheMode.NONE:
-            self._cache[key] = CacheEntry(value=value, etag=etag)
-        if self.cache_mode in (CacheMode.WRITE_THROUGH, CacheMode.NONE):
-            await self._upload_json(key, value, etag)
-
-    async def _upload_json(
-        self, key: str, value: ExtendedJSON, etag: str | None
-    ) -> None:
-        blob = self.container.get_blob(self._blob_name(key, ".json"))
-        data_bytes = json.dumps(value, default=default_encoder).encode("utf-8")
-        try:
-            await blob.upload(data_bytes, overwrite=True, if_match=etag)
-        except ConcurrencyError:
-            raise
-
-    async def get_binary(self, key: str) -> bytes:
-        if self.cache_mode != CacheMode.NONE and key in self._cache:
-            return self._cache[key].value
-        blob = self.container.get_blob(self._blob_name(key, ".bin"))
-        try:
-            data = await blob.download()
-        except FileNotFoundError:
-            raise BlobNotFoundError(f"Blob '{key}' not found")
-        etag = (
-            await blob.get_etag()
-            if self.concurrency_mode == ConcurrencyMode.ETAG
-            else None
-        )
-        if self.cache_mode != CacheMode.NONE:
-            self._cache[key] = CacheEntry(value=data, etag=etag)
-        return data
-
-    async def set_binary(
-        self, key: str, data: bytes, _test_use_stale_etag: bool = False
-    ) -> None:
-        if not isinstance(data, (bytes, bytearray)):
-            raise ValueError(f"Binary data for key '{key}' must be bytes or bytearray")
-        etag = (
-            self._cache[key].etag
-            if self.cache_mode != CacheMode.NONE
-            else None
-        )
-        if (
-            self.concurrency_mode == ConcurrencyMode.ETAG
-            and etag is None
-            and not _test_use_stale_etag
-        ):
-            blob = self.container.get_blob(self._blob_name(key, ".bin"))
-            try:
-                etag = await blob.get_etag()
-            except FileNotFoundError:
-                pass
-        if self.cache_mode != CacheMode.NONE:
-            self._cache[key] = CacheEntry(value=data, etag=etag)
-        if self.cache_mode in (CacheMode.WRITE_THROUGH, CacheMode.NONE):
-            await self._upload_binary(key, data, etag)
-
-    async def _upload_binary(self, key: str, data: bytes, etag: str | None) -> None:
-        blob = self.container.get_blob(self._blob_name(key, ".bin"))
-        try:
-            await blob.upload(data, overwrite=True, if_match=etag)
-        except ConcurrencyError:
-            raise
-
-    async def delete(self, key: str) -> None:
-        for ext in (".json", ".bin"):
-            blob = self.container.get_blob(self._blob_name(key, ext))
-            try:
-                await blob.delete()
-            except FileNotFoundError:
-                pass
-        if self.cache_mode != CacheMode.NONE and key in self._cache:
-            del self._cache[key]
+        if blob_name in self._cache:
+            del self._cache[blob_name]
 
     async def list_keys(self, prefix: str = "") -> list[str]:
+        """
+        List blob names in container.
+        """
         return await self.container.list_blob_names(prefix)
-
-    async def sync_simple(self) -> None:
-        if self.cache_mode == CacheMode.NONE:
-            raise RuntimeError("Cache is disabled, nothing to sync.")
-        for key, cache_entry in self._cache.items():
-            if isinstance(cache_entry.value, bytes):
-                await self._upload_binary(key, cache_entry.value, cache_entry.etag)
-            else:
-                await self._upload_json(key, cache_entry.value, cache_entry.etag)
 
     async def sync(
         self, etag_behavior: Literal["skip", "overwrite", "raise"] = "skip"
     ) -> None:
+        """
+        Flush cached blobs to backend.
+        """
         if self.cache_mode == CacheMode.NONE:
+            # TODO Should probably clean cache if mode is changed mid way.
             raise RuntimeError("Cache is disabled, nothing to sync.")
-        # for key, (value, cached_etag) in list(self._cache.items()):
-        for key, cache_entry in list(self._cache.items()):
-            value = cache_entry.value
-            cached_etag = cache_entry.etag
-            ext = ".bin" if isinstance(value, (bytes, bytearray)) else ".json"
-            blob = self.container.get_blob(self._blob_name(key, ext))
-            try:
-                latest_etag = await blob.get_etag()
-            except FileNotFoundError:
-                latest_etag = None
+
+        for blob_name, entry in list(self._cache.items()):
+            blob = self.container.get_blob(blob_name)
+            latest_etag = await self.get_etag_or_none(blob)
+
             if (
                 self.concurrency_mode == ConcurrencyMode.ETAG
-                and cached_etag is not None
-                and latest_etag != cached_etag
+                and entry.etag is not None
+                and latest_etag != entry.etag
             ):
                 if etag_behavior == "skip":
                     print(
-                        f"[Sync] [WARNING] Conflict detected for '{key}', skipping upload."
+                        f"[Sync] [WARNING] Conflict detected for '{blob_name}', skipping upload."
                     )
                     continue
                 elif etag_behavior == "raise":
                     raise ConcurrencyError(
-                        f"ETag mismatch for '{key}': cached={cached_etag}, remote={latest_etag}"
+                        f"ETag mismatch for '{blob_name}': cached={entry.etag}, remote={latest_etag}"
                     )
                 elif etag_behavior == "overwrite":
-                    print(f"[Sync] [INFO] Conflict detected for '{key}', overwriting.")
+                    print(
+                        f"[Sync] [INFO] Conflict detected for '{blob_name}', overwriting."
+                    )
                     latest_etag = None
-            if isinstance(value, (bytes, bytearray)):
-                await self._upload_binary(key, value, latest_etag)
-            else:
-                await self._upload_json(key, value, latest_etag)
-            try:
-                new_etag = await blob.get_etag()
-            except FileNotFoundError:
-                new_etag = None
-            self._cache[key] = CacheEntry(value=value, etag=new_etag)
 
-        if self.concurrency_mode == ConcurrencyMode.ETAG:
-            print(
-                f"[Sync] Synced {len(self._cache)} items with ETag protection, behavior={etag_behavior}."
+            await blob.upload(entry.value, overwrite=True, if_match=latest_etag)
+            self._cache[blob_name] = CacheEntry(
+                value=entry.value, etag=await self.get_etag_or_none(blob)
             )
-        else:
-            print(f"[Sync] Synced {len(self._cache)} items without ETag protection.")
 
-    async def get(self, key: str) -> Any:
-        """
-        Retrieve a JSON blob from storage.
 
-        Args:
-            key: The blob key without extension.
+class AsyncFormatBlobStore:
+    """
+    Format-aware store: wraps AsyncCoreBlobStore to add JSON/binary serialization.
+    Responsible for naming (.json) and format validation.
+    """
 
-        Returns:
-            The deserialized JSON object.
+    def __init__(
+        self,
+        core_store: AsyncCoreBlobStore,
+        json_serializer: JSONSerializer | None = None,
+        binary_serializer: BinarySerializer | None = None,
+    ) -> None:
+        self.core = core_store
+        self.json_serializer = json_serializer or JSONSerializer()
+        self.binary_serializer = binary_serializer or BinarySerializer()
 
-        Raises:
-            BlobNotFoundError: If the blob does not exist.
-            ValueError: If the blob contains invalid JSON.
-        """
+    def _blob_name_json(self, key: str) -> str:
+        assert isinstance(key, str)
+        return f"{key}.json"
+
+    def _blob_name_binary(self, key: str) -> str:
+        assert isinstance(key, str)
+        return key
+
+    async def get_json(self, key: str) -> ExtendedJSON:
+        blob_name = self._blob_name_json(key)
+        raw = await self.core.get_bytes(blob_name)  # cache key now always blob_name
+        try:
+            return self.json_serializer.deserialize(raw)
+        except Exception as e:
+            raise ValueError(f"Blob '{key}' is not valid JSON") from e
+
+    async def set_json(
+        self, key: str, value: ExtendedJSON, force_no_etag_check: bool = False
+    ) -> None:
+        raw = self.json_serializer.serialize(value)
+        blob_name = self._blob_name_json(key)
+        await self.core.set_bytes(
+            blob_name,
+            raw,
+            force_no_etag_check=force_no_etag_check,
+        )
+
+    async def get_binary(self, key: str) -> bytes:
+        blob_name = self._blob_name_binary(key)
+        return await self.core.get_bytes(blob_name)
+
+    async def set_binary(
+        self, key: str, data: bytes, force_no_etag_check: bool = False
+    ) -> None:
+        raw = self.binary_serializer.serialize(data)
+        blob_name = self._blob_name_binary(key)
+        await self.core.set_bytes(
+            blob_name,
+            raw,
+            force_no_etag_check=force_no_etag_check,
+        )
+
+    async def delete_json(self, key: str) -> None:
+        blob_name = self._blob_name_json(key)
+        await self.core.delete(blob_name)
+
+    async def delete_binary(self, key: str) -> None:
+        blob_name = self._blob_name_binary(key)
+        await self.core.delete(blob_name)
+
+    async def list_keys(self, prefix: str = "") -> list[str]:
+        return await self.core.list_keys(prefix)
+
+
+class AsyncBlobStore:
+    """
+    Compatibility wrapper for old AsyncBlobStore API.
+    """
+
+    def __init__(
+        self,
+        adapter: AsyncStorageAdapter,
+        container_name: str,
+        cache_mode: CacheMode = CacheMode.NONE,
+        concurrency_mode: ConcurrencyMode = ConcurrencyMode.NONE,
+        json_serializer: JSONSerializer | None = None,
+        binary_serializer: BinarySerializer | None = None,
+    ) -> None:
+        self._core = AsyncCoreBlobStore(
+            adapter,
+            container_name,
+            cache_mode=cache_mode,
+            concurrency_mode=concurrency_mode,
+        )
+        self._format = AsyncFormatBlobStore(
+            self._core,
+            json_serializer=json_serializer,
+            binary_serializer=binary_serializer,
+        )
+        # Compatibility: expose _cache for tests
+        self._cache = self._core._cache
+        self.concurrency_mode = self._core.concurrency_mode
+
+    async def __aenter__(self) -> "AsyncBlobStore":
+        await self._core.__aenter__()
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self._core.__aexit__(exc_type, exc, tb)
+
+    async def close(self) -> None:
+        await self._core.close()
+
+    async def get_json(self, key: str) -> ExtendedJSON:
+        return await self._format.get_json(key)
+
+    async def set_json(self, key: str, value: ExtendedJSON) -> None:
+        await self._format.set_json(key, value)
+
+    async def get_binary(self, key: str) -> bytes:
+        return await self._format.get_binary(key)
+
+    async def set_binary(self, key: str, data: bytes) -> None:
+        await self._format.set_binary(key, data)
+
+    async def delete_json(self, key: str) -> None:
+        await self._format.delete_json(key)
+
+    async def delete_binary(self, key: str) -> None:
+        await self._format.delete_binary(key)
+
+    async def list_keys(self, prefix: str = "") -> list[str]:
+        return await self._format.list_keys(prefix)
+
+    async def sync(
+        self, etag_behavior: Literal["skip", "overwrite", "raise"] = "skip"
+    ) -> None:
+        await self._core.sync(etag_behavior)
+
+    async def get(self, key: str) -> ExtendedJSON:
         return await self.get_json(key)
 
-    async def set(self, key: str, value: Any) -> None:
+    async def set(self, key: str, value: ExtendedJSON) -> None:
         return await self.set_json(key, value)
+
+    async def delete(self, key: str) -> None:
+        await self.delete_json(key)

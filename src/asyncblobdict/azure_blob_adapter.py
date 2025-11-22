@@ -1,9 +1,15 @@
+import mimetypes
 from typing import Any
 
-from .async_blob_store import ConcurrencyError
-from azure.core.exceptions import ResourceModifiedError, ResourceNotFoundError, ResourceExistsError, HttpResponseError
+from azure.core.exceptions import (
+    HttpResponseError,
+    ResourceExistsError,
+    ResourceModifiedError,
+    ResourceNotFoundError,
+)
 from azure.storage.blob.aio import BlobServiceClient
 
+from .errors import BlobNotFoundError, ConcurrencyError
 from .storage_protocols import (
     AsyncBlobHandle,
     AsyncContainerHandle,
@@ -59,12 +65,22 @@ class _AzureBlobHandle(AsyncBlobHandle):
             stream = await self._blob_client.download_blob()
             return await stream.readall()
         except ResourceNotFoundError:
-            raise FileNotFoundError()
+            raise BlobNotFoundError(f"Blob '{self._blob_client.blob_name}' not found")
 
     async def upload(
-        self, data: bytes, overwrite: bool = True, if_match: str | None = None
+        self,
+        data: bytes,
+        overwrite: bool = True,
+        if_match: str | None = None,
+        content_type: str | None = None,
     ) -> None:
-        kwargs: dict[str, Any] = {"overwrite": overwrite}
+        """Note: Guesses content type if not provided."""
+
+        if content_type is None:
+            guessed, _ = mimetypes.guess_type(self._blob_client.blob_name)
+            content_type = guessed or "application/octet-stream"
+
+        kwargs: dict[str, Any] = {"overwrite": overwrite, "content_type": content_type}
         if if_match:
             kwargs["if_match"] = if_match
         try:
@@ -79,18 +95,20 @@ class _AzureBlobHandle(AsyncBlobHandle):
             )
         except HttpResponseError as e:
             if getattr(e, "status_code", None) == 412:
-                raise ConcurrencyError(f"ETag mismatch for blob '{self._blob_client.blob_name}'")
+                raise ConcurrencyError(
+                    f"ETag mismatch for blob '{self._blob_client.blob_name}'"
+                )
             raise
 
     async def delete(self) -> None:
         try:
             await self._blob_client.delete_blob()
         except ResourceNotFoundError:
-            raise FileNotFoundError()
+            raise BlobNotFoundError(f"Blob '{self._blob_client.blob_name}' not found")
 
     async def get_etag(self) -> str | None:
         try:
             props = await self._blob_client.get_blob_properties()
             return props.etag
         except ResourceNotFoundError:
-            raise FileNotFoundError()
+            raise BlobNotFoundError(f"Blob '{self._blob_client.blob_name}' not found")

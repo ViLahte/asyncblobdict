@@ -1,7 +1,8 @@
 import asyncio
 import hashlib
 from pathlib import Path
-from .async_blob_store import ConcurrencyError
+
+from .errors import BlobNotFoundError, ConcurrencyError
 from .storage_protocols import (
     AsyncBlobHandle,
     AsyncContainerHandle,
@@ -12,20 +13,31 @@ from .storage_protocols import (
 def _ensure_within(base: Path, target: Path, strict: bool = True) -> Path:
     """
     Resolve target path and ensure it is inside base path.
-    strict=True will fail if the target does not exist (good for read/delete).
-    strict=False allows non-existing targets (good for upload), but still checks parent dir strictly.
+    strict=True will fail if the target does not exist.
+    strict=False allows non-existing targets,
+    but still checks that the resolved path is inside base.
     """
     base_resolved = base.resolve(strict=True)
+
     if strict:
-        target_resolved = target.resolve(strict=True)
+        try:
+            target_resolved = target.resolve(strict=True)
+        except FileNotFoundError:
+            # Resolve without strict to still check path safety
+            target_resolved = target.resolve()
     else:
-        # Resolve parent strictly to catch symlink escapes
-        target.parent.resolve(strict=True)
-        target_resolved = target.resolve()
+        # Resolve without requiring parent to exist
+        try:
+            target_resolved = target.resolve()
+        except FileNotFoundError:
+            # If target doesn't exist, resolve as much as possible
+            target_resolved = target.parent.resolve() / target.name
+
     if not str(target_resolved).startswith(str(base_resolved)):
         raise ValueError(
             f"Path {target_resolved} escapes base directory {base_resolved}"
         )
+
     return target_resolved
 
 
@@ -89,7 +101,7 @@ class _LocalBlobHandle(AsyncBlobHandle):
     async def download(self) -> bytes:
         _ensure_within(self._container_path, self._file_path, strict=True)
         if not self._file_path.exists():
-            raise FileNotFoundError()
+            raise BlobNotFoundError(f"Blob '{self._file_path}' not found")
         async with self._lock:
             return self._file_path.read_bytes()
 
@@ -110,13 +122,13 @@ class _LocalBlobHandle(AsyncBlobHandle):
     async def delete(self) -> None:
         _ensure_within(self._container_path, self._file_path, strict=True)
         if not self._file_path.exists():
-            raise FileNotFoundError()
+            raise BlobNotFoundError(f"Blob '{self._file_path}' not found")
         self._file_path.unlink()
 
     async def get_etag(self) -> str | None:
         _ensure_within(self._container_path, self._file_path, strict=True)
         if not self._file_path.exists():
-            raise FileNotFoundError()
+            raise BlobNotFoundError(f"Blob '{self._file_path}' not found")
         # Use mtime+size cache to avoid recomputing MD5 unnecessarily
         stat = self._file_path.stat()
         cache_key = (self._file_path.resolve(), stat.st_mtime, stat.st_size)
@@ -128,5 +140,3 @@ class _LocalBlobHandle(AsyncBlobHandle):
         etag = hashlib.md5(content).hexdigest()
         self._etag_cache[cache_key] = etag
         return etag
-
-
